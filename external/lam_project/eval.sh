@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=lam_bridge_test
+#SBATCH --job-name=eval_results
 #SBATCH --nodes=1                         # Number of nodes
 #SBATCH --gres=gpu:1                      # Number of GPUs
 #SBATCH --ntasks=1                        # One process (adjust if your script is multi-proc)
-#SBATCH --cpus-per-task=8                 # CPU cores
+#SBATCH --cpus-per-task=64                 # CPU cores
 #SBATCH --mem=80G                         # Memory
 #SBATCH --time=24:00:00                   # Time limit (hh:mm:ss)
 #SBATCH --output=slurm_outputs/%x/out_%x_%j.out
@@ -39,8 +39,6 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 export OMP_NUM_THREADS=4
 export OPENCV_NUM_THREADS=2
 
-python main.py test \
-    --ckpt_path /n/fs/geniemodel/DreamDojo/checkpoints/LAM/LAM_400k.ckpt \
-    --config config/lam_bridge_test.yaml \
-    --data.num_workers=4 \
-    2>&1 | tee output_test.log
+python /n/fs/geniemodel/DreamDojo/external/lam_project/vidwm/metrics/perceptual_metrics.py --lam_eval --num_samples 100 
+
+ 

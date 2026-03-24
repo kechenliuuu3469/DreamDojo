@@ -11,7 +11,9 @@
 #SBATCH --mail-user=kl0820@princeton.edu
 #SBATCH --exclude=neu301,neu306,neu309,neu312
 
-
+# ============================================
+# Environment setup
+# ============================================
 module purge
 module load anaconda3/2024.02
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -34,13 +36,39 @@ fi
 
 conda activate dreamdojo_lam
 
-cd /n/fs/geniemodel/DreamDojo/external/lam_project
-export PYTHONPATH=$(pwd):$PYTHONPATH
+# ============================================
+# Thread limits (fixes OpenCV thread errors)
+# ============================================
 export OMP_NUM_THREADS=4
 export OPENCV_NUM_THREADS=2
+export MKL_NUM_THREADS=4
 
-python main.py test \
+# ============================================
+# Project setup
+# ============================================
+cd $BIG/DreamDojo/external/lam_project
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
+mkdir -p slurm_logs
+
+# ============================================
+# Run training
+# ============================================
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURM_NODELIST"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+echo "Start time: $(date)"
+echo "Config: config/lam_bridge_test.yaml"
+echo "=========================================="
+
+python infer_lam.py \
     --ckpt_path /n/fs/geniemodel/DreamDojo/checkpoints/LAM/LAM_400k.ckpt \
-    --config config/lam_bridge_test.yaml \
-    --data.num_workers=4 \
-    2>&1 | tee output_test.log
+    --video_dir /n/fs/geniemodel/DreamDojo/datasets/train \
+    --num_videos 100 \
+    --extract_full \
+    --save_dir lam_inference_output
+
+echo "=========================================="
+echo "End time: $(date)"
+echo "=========================================="

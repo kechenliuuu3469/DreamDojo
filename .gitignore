@@ -1,68 +1,30 @@
-# Python
+datasets/
+external/lam_project/slurm_outputs/
+external/lam_project/exp_ckpts*/
+external/lam_project/exp_*/
+external/lam_project/eval_*/
+checkpoints/LAM/
+
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-dist/
-build/
-eggs/
-*.whl
-
-# Virtual environments
+.ipynb_checkpoints/
 .venv/
 venv/
 env/
-
-# IDE / Editor
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+*.log
+*.out
+*.err
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.project
-.settings/
-
-# Jupyter Notebook
-.ipynb_checkpoints/
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Credentials / Secrets
-credentials/
-*.pem
-*.key
 .env
 .env.*
-
-# Data / Model artifacts
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.bin
-*.h5
-*.onnx
-
-# Media
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.gif
-!assets/*.gif
-
-# Logs
-*.log
-logs/
-
-# Debug / Output
-debug/
-output*/
-
-# Launchers (internal)
-osmo_launch.py
-ray_launch.py
+.cache/
+.pytest_cache/
+.mypy_cache/

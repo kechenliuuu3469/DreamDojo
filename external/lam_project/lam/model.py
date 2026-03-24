@@ -1,15 +1,19 @@
 from os import makedirs, path
-from typing import Callable, Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Tuple, Union
 
 import numpy as np
-import piq
 import torch
 from PIL import Image
 from einops import rearrange
-# from kmeans_pytorch import kmeans
 from lightning import LightningModule
 from torch import Tensor
 from torch.optim import AdamW, Optimizer
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 OptimizerCallable = Callable[[Iterable], Optimizer]
 
@@ -31,7 +35,8 @@ class LAM(LightningModule):
         beta: float = 0.01,
         log_interval: int = 1000,
         log_path: str = "log_imgs",
-        optimizer: OptimizerCallable = AdamW
+        optimizer: OptimizerCallable = AdamW,
+        ckpt_path: Union[None, str] = None
     ) -> None:
         super(LAM, self).__init__()
         self.lam = LatentActionModel(
@@ -49,7 +54,21 @@ class LAM(LightningModule):
         self.log_path = log_path
         self.optimizer = optimizer
 
-        self.save_hyperparameters()
+        self.ckpt_path = ckpt_path
+        if ckpt_path is not None:
+            self.reload_ckpt(ckpt_path)
+
+    def reload_ckpt(self, ckpt_path: str) -> None:
+        if path.exists(ckpt_path):
+            lam = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+            missing, unexpected = self.load_state_dict(lam, assign=True)
+            print(f"Restored LAM from {ckpt_path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
+            if len(missing) > 0:
+                print(f"Missing LAM keys: {missing}")
+            if len(unexpected) > 0:
+                print(f"Unexpected LAM keys: {unexpected}")
+        else:
+            print(f"LAM checkpoint {ckpt_path} does not exist")
 
     def shared_step(self, batch: Dict) -> Tuple:
         outputs = self.lam(batch)
@@ -59,17 +78,9 @@ class LAM(LightningModule):
         mse_loss = ((gt_future_frames - outputs["recon"]) ** 2).mean()
         kl_loss = -0.5 * torch.sum(1 + outputs["z_var"] - outputs["z_mu"] ** 2 - outputs["z_var"].exp(), dim=1).mean()
         loss = mse_loss + self.beta * kl_loss
-
-        # Compute monitoring measurements
-        gt = gt_future_frames.clamp(0, 1).reshape(-1, *gt_future_frames.shape[2:]).permute(0, 3, 1, 2)
-        recon = outputs["recon"].clamp(0, 1).reshape(-1, *outputs["recon"].shape[2:]).permute(0, 3, 1, 2)
-        psnr = piq.psnr(gt, recon).mean()
-        ssim = piq.ssim(gt, recon).mean()
         return outputs, loss, (
             ("mse_loss", mse_loss),
-            ("kl_loss", kl_loss),
-            ("psnr", psnr),
-            ("ssim", ssim)
+            ("kl_loss", kl_loss)
         )
 
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -86,37 +97,28 @@ class LAM(LightningModule):
             sync_dist=True
         )
 
-        self.log(
-            "global_step",
-            self.global_step,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=False
-        )
-
         if batch_idx % self.log_interval == 0:  # Start of the epoch
             self.log_images(batch, outputs, "train")
         return loss
 
-    # @torch.no_grad()
-    # def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
-    #     # Compute the validation loss
-    #     outputs, loss, aux_losses = self.shared_step(batch)
-    #
-    #     # Log the validation loss
-    #     self.log_dict(
-    #         {**{"val_loss": loss}, **{f"val/{k}": v for k, v in aux_losses}},
-    #         prog_bar=True,
-    #         logger=True,
-    #         on_step=True,
-    #         on_epoch=True,
-    #         sync_dist=True
-    #     )
-    #
-    #     if batch_idx % self.log_interval == 0:  # Start of the epoch
-    #         self.log_images(batch, outputs, "val")
-    #     return loss
+    @torch.no_grad()
+    def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
+        # Compute the validation loss
+        outputs, loss, aux_losses = self.shared_step(batch)
+    
+        # Log the validation loss
+        self.log_dict(
+            {**{"val_loss": loss}, **{f"val/{k}": v for k, v in aux_losses}},
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True
+        )
+    
+        if batch_idx % self.log_interval == 0:  # Start of the epoch
+            self.log_images(batch, outputs, "val")
+        return loss
 
     @torch.no_grad()
     def test_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -150,6 +152,12 @@ class LAM(LightningModule):
             img.save(img_path)
         except:
             pass
+        
+        # Log to wandb if available
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log({
+                f"{split}/reconstruction": wandb.Image(img, caption=f"{split}_step{self.global_step}")
+            }, step=self.global_step)
 
     def configure_optimizers(self) -> Optimizer:
         optim = self.optimizer(self.parameters())

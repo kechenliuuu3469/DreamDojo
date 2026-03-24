@@ -9,6 +9,12 @@ from lightning import LightningModule
 from torch import Tensor
 from torch.optim import AdamW, Optimizer
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 OptimizerCallable = Callable[[Iterable], Optimizer]
 
 from external.lam.modules import LatentActionModel
@@ -95,24 +101,24 @@ class LAM(LightningModule):
             self.log_images(batch, outputs, "train")
         return loss
 
-    # @torch.no_grad()
-    # def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
-    #     # Compute the validation loss
-    #     outputs, loss, aux_losses = self.shared_step(batch)
-    #
-    #     # Log the validation loss
-    #     self.log_dict(
-    #         {**{"val_loss": loss}, **{f"val/{k}": v for k, v in aux_losses}},
-    #         prog_bar=True,
-    #         logger=True,
-    #         on_step=True,
-    #         on_epoch=True,
-    #         sync_dist=True
-    #     )
-    #
-    #     if batch_idx % self.log_interval == 0:  # Start of the epoch
-    #         self.log_images(batch, outputs, "val")
-    #     return loss
+    @torch.no_grad()
+    def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
+        # Compute the validation loss
+        outputs, loss, aux_losses = self.shared_step(batch)
+    
+        # Log the validation loss
+        self.log_dict(
+            {**{"val_loss": loss}, **{f"val/{k}": v for k, v in aux_losses}},
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True
+        )
+    
+        if batch_idx % self.log_interval == 0:  # Start of the epoch
+            self.log_images(batch, outputs, "val")
+        return loss
 
     @torch.no_grad()
     def test_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -146,6 +152,12 @@ class LAM(LightningModule):
             img.save(img_path)
         except:
             pass
+        
+        # Log to wandb if available
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log({
+                f"{split}/reconstruction": wandb.Image(img, caption=f"{split}_step{self.global_step}")
+            }, step=self.global_step)
 
     def configure_optimizers(self) -> Optimizer:
         optim = self.optimizer(self.parameters())

@@ -1,3 +1,12 @@
+
+# =============================================================================
+# UPDATED: VideoDataset — used for TRAINING via MultiSourceSamplerDataset
+# Added rgb_skip parameter for configurable frame skipping per dataset.
+# gap = rgb_skip * frame_skip (random: e.g., 3, 6, 9, or 12 for rgb_skip=3)
+# If rgb_skip=1 (default), behavior is identical to original code.
+# =============================================================================
+
+
 import math
 from random import choices, randint
 from typing import Any, Callable, Dict, List, Optional
@@ -6,7 +15,6 @@ from pathlib import Path
 import os
 os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = str(2 ** 13)
 import cv2 as cv
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -123,7 +131,7 @@ class LightningDataset(LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader:
-        if isinstance(self.test_dataset, IterableDataset):
+        if isinstance(self.train_dataset, IterableDataset):
             worker_init_fn = default(self.worker_init_fn, default_worker_init_fn)
         else:
             worker_init_fn = self.worker_init_fn
@@ -138,6 +146,7 @@ class LightningDataset(LightningDataModule):
         )
 
 
+
 class VideoDataset(Dataset):
     def __init__(
         self,
@@ -147,7 +156,7 @@ class VideoDataset(Dataset):
         num_frames: int = 16,
         output_format: str = "t h w c",
         color_aug: bool = True,
-        rgb_skip: int = 1
+        rgb_skip: int = 1               # UPDATED: configurable frame skip, default 1 = original behavior
     ) -> None:
         super(VideoDataset, self).__init__()
         self.padding = padding
@@ -155,8 +164,9 @@ class VideoDataset(Dataset):
         self.num_frames = num_frames
         self.output_format = output_format
         self.color_aug = color_aug
-        self.rgb_skip = rgb_skip
+        self.rgb_skip = rgb_skip          # UPDATED
 
+        # Get all the file path based on the split path
         mp4_list = list(Path(subset_path).rglob("*.mp4"))
         if len(mp4_list) > 0:
             if "xdof" in subset_path:
@@ -195,17 +205,20 @@ class VideoDataset(Dataset):
         cap = cv.VideoCapture(video_path)
         total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
 
+        # UPDATED: compute effective frame count after rgb_skip
         rgb_skip = self.rgb_skip
         effective_frames = total_frames // max(rgb_skip, 1)
 
+        frame_skip = randint(1, 4)
+        num_frames = num_frames * frame_skip
+
+        # UPDATED: compute start in effective space, convert to raw
         start_frame = start_frame if exists(start_frame) else randint(0, max(0, effective_frames - num_frames))
         raw_start = start_frame * rgb_skip
         cap.set(cv.CAP_PROP_POS_FRAMES, raw_start)
 
-        num_frames = num_frames * frame_skip
-
         frames = []
-        for _ in range(raw_start, raw_start + num_frames * rgb_skip, rgb_skip):
+        for _ in range(num_frames):
             ret, frame = cap.read()
             if ret:
                 frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -254,12 +267,14 @@ class VideoDataset(Dataset):
 
     def build_data_dict(self, video: Tensor) -> Dict:
         if self.color_aug:
+            # Brightness jitter
             video = (video + torch.rand(1) * 0.2 - 0.1).clamp(0, 1)
 
         data_dict = {
             "videos": video
         }
         return data_dict
+
 
 
 class OriginalVideoDataset(Dataset):
@@ -327,10 +342,12 @@ class OriginalVideoDataset(Dataset):
         for _ in range(num_frames):
             ret, frame = cap.read()
             if ret:
+                # Frame was successfully read, parse it
                 frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
                 frame = torch.from_numpy(frame)
                 frames.append(frame)
             else:
+                # Reach the end of video, deal with padding and return
                 if self.padding == "none":
                     pass
                 elif self.padding == "repeat":
@@ -366,6 +383,7 @@ class OriginalVideoDataset(Dataset):
 
     def build_data_dict(self, video: Tensor) -> Dict:
         if self.color_aug:
+            # Brightness jitter
             video = (video + torch.rand(1) * 0.2 - 0.1).clamp(0, 1)
 
         data_dict = {
@@ -382,12 +400,12 @@ class MultiSourceSamplerDataset(Dataset):
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
         color_aug: bool = True,
-        rgb_skips: Optional[list] = None,
-        stacking_mode: Optional[str] = None,
+        rgb_skips: Optional[list] = None,                               # UPDATED
         **kwargs
     ) -> None:
         self.samples_per_epoch = samples_per_epoch
 
+        # UPDATED: default to [1, 1, ...] if not provided
         if rgb_skips is None:
             rgb_skips = [1] * len(dataset_paths)
         elif len(rgb_skips) != len(dataset_paths):
@@ -397,41 +415,30 @@ class MultiSourceSamplerDataset(Dataset):
             )
 
         self.subsets = []
-        for subset_path, skip in tqdm(zip(dataset_paths, rgb_skips), desc="Loading subsets...", total=len(dataset_paths)):
-            if stacking_mode is not None and "droid" in subset_path.lower():
-                # Use stacked multi-view dataset for DROID
-                from lam.dataset_stacked import StackedDroidVideoDataset
-                self.subsets.append(StackedDroidVideoDataset(
-                    subset_path=subset_path,
-                    color_aug=color_aug,
-                    rgb_skip=skip,
-                    stacking_mode=stacking_mode,
-                    num_frames=kwargs.get('num_frames', 16),
-                    randomize=kwargs.get('randomize', False),
-                    padding=kwargs.get('padding', 'repeat'),
-                    output_format=kwargs.get('output_format', 't h w c'),
-                ))
-                print(f"Subset: {subset_path} | Episodes: {len(self.subsets[-1])} | "
-                      f"rgb_skip: {skip} | stacking: {stacking_mode}")
-            else:
-                # Use regular single-view dataset
-                self.subsets.append(VideoDataset(
-                    subset_path=subset_path,
-                    color_aug=color_aug,
-                    rgb_skip=skip,
-                    **kwargs
-                ))
-                print(f"Subset: {subset_path} | Videos: {len(self.subsets[-1])} | rgb_skip: {skip}")
+        for subset_path, skip in tqdm(zip(dataset_paths, rgb_skips), desc="Loading subsets...", total=len(dataset_paths)):  # UPDATED
+            self.subsets.append(VideoDataset(
+                subset_path=subset_path,
+                color_aug=color_aug,
+                rgb_skip=skip,                                          # UPDATED: pass rgb_skip
+                **kwargs
+            ))
+            print(f"Subset: {subset_path} | Videos: {len(self.subsets[-1])} | rgb_skip: {skip}")  # UPDATED
         print("Number of subsets:", len(self.subsets))
 
         if sampling_strategy == "sample":
+            # Sample uniformly from all samples
             probs = [len(d) for d in self.subsets]
         elif sampling_strategy == "dataset":
+            # Sample uniformly from all datasets
             probs = [1 for _ in self.subsets]
         elif sampling_strategy == "log":
+            # Generate probabilities according to the scale of each dataset
             probs = [math.log(len(d)) if len(d) else 0 for d in self.subsets]
         elif sampling_strategy == "pi":
+            # Generate probabilities according to the scale of each dataset
             probs = [len(d) ** 0.43 for d in self.subsets]
+        # elif sampling_strategy == "manual":
+        #     probs = [1, 1, 0.2, 0.2, 0.2, 0.2, 0.2, 10, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
         else:
             raise ValueError(f"Unavailable sampling strategy: {sampling_strategy}")
         total_prob = sum(probs)
@@ -443,10 +450,22 @@ class MultiSourceSamplerDataset(Dataset):
         return self.samples_per_epoch
 
     def __getitem__(self, idx: int) -> Dict:
+        """
+        Args:
+        index (int): Index (ignored since we sample randomly).
+
+        Returns:
+        TensorDict: Dict containing all the data blocks.
+        """
+
+        # Randomly select a subset based on weights
         subset = choices(self.subsets, self.sample_probs)[0]
+
+        # Sample a valid sample with a random index
         sample_idx = randint(0, len(subset) - 1)
         sample_item = subset[sample_idx]
         return sample_item
+
 
 
 class LightningVideoDataset(LightningDataset):
@@ -459,8 +478,7 @@ class LightningVideoDataset(LightningDataset):
         output_format: str = "t h w c",
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
-        rgb_skips: Optional[list] = None,
-        stacking_mode: Optional[str] = None,
+        rgb_skips: Optional[list] = None,                               # UPDATED
         **kwargs
     ) -> None:
         super(LightningVideoDataset, self).__init__(**kwargs)
@@ -471,8 +489,7 @@ class LightningVideoDataset(LightningDataset):
         self.output_format = output_format
         self.samples_per_epoch = samples_per_epoch
         self.sampling_strategy = sampling_strategy
-        self.rgb_skips = rgb_skips
-        self.stacking_mode = stacking_mode
+        self.rgb_skips = rgb_skips                                      # UPDATED
 
         self.save_hyperparameters()
 
@@ -487,10 +504,8 @@ class LightningVideoDataset(LightningDataset):
                 output_format=self.output_format,
                 samples_per_epoch=self.samples_per_epoch,
                 sampling_strategy=self.sampling_strategy,
-                rgb_skips=self.rgb_skips,
-                stacking_mode=self.stacking_mode,
+                rgb_skips=self.rgb_skips                                # UPDATED: pass rgb_skips
             )
-
             # self.val_dataset = MultiSourceSamplerDataset(
             #     dataset_paths=self.dataset_paths,
             #     split="test",
@@ -502,8 +517,8 @@ class LightningVideoDataset(LightningDataset):
             #     sampling_strategy=self.sampling_strategy,
             #     color_aug=False
             # )
-
         elif stage == "test":
+            # UNCHANGED: OriginalVideoDataset has no rgb_skip, uses original logic
             self.test_dataset = OriginalVideoDataset(
                 dataset_paths=self.dataset_paths,
                 split="test",

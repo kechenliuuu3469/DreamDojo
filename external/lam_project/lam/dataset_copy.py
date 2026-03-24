@@ -108,12 +108,12 @@ class LightningDataset(LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader:
-        if isinstance(self.train_dataset, IterableDataset):
+        if isinstance(self.val_dataset, IterableDataset):
             worker_init_fn = default(self.worker_init_fn, default_worker_init_fn)
         else:
             worker_init_fn = self.worker_init_fn
         return DataLoader(
-            self.train_dataset,
+            self.val_dataset,
             sampler=self.val_sampler,
             batch_size=self.val_batch_size,
             shuffle=self.val_shuffle,
@@ -491,17 +491,27 @@ class LightningVideoDataset(LightningDataset):
                 stacking_mode=self.stacking_mode,
             )
 
-            # self.val_dataset = MultiSourceSamplerDataset(
-            #     dataset_paths=self.dataset_paths,
-            #     split="test",
-            #     padding=self.padding,
-            #     randomize=self.randomize,
-            #     num_frames=self.num_frames,
-            #     output_format=self.output_format,
-            #     samples_per_epoch=self.samples_per_epoch // 1000,
-            #     sampling_strategy=self.sampling_strategy,
-            #     color_aug=False
-            # )
+            # Build val paths: Bridge uses /test, DROID uses /val
+            val_paths = []
+            for p in self.dataset_paths:
+                if "droid" in p.lower():
+                    val_paths.append(p.replace("/train", "/val"))
+                else:
+                    val_paths.append(p.replace("/train", "/test"))
+
+            self.val_dataset = MultiSourceSamplerDataset(
+                dataset_paths=val_paths,
+                split="test",
+                padding=self.padding,
+                randomize=self.randomize,
+                num_frames=self.num_frames,
+                output_format=self.output_format,
+                samples_per_epoch=self.samples_per_epoch // 1000,
+                sampling_strategy=self.sampling_strategy,
+                rgb_skips=self.rgb_skips,
+                stacking_mode=self.stacking_mode,
+                color_aug=False,
+            )
 
         elif stage == "test":
             self.test_dataset = OriginalVideoDataset(
