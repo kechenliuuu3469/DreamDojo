@@ -1,0 +1,6 @@
+name: dreamdojo_lam
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /n/fs/geniemodel/conda/envs/dreamdojo_lam
