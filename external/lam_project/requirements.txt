@@ -1,0 +1,29 @@
+# LAM (Latent Action Model) training dependencies
+# Install with: pip install -r requirements.txt
+#
+# For PyTorch with specific CUDA version, install torch+torchvision FIRST:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Then install the rest:
+#   pip install -r requirements.txt
+
+# Core training
+lightning>=2.6.0
+einops>=0.8.0
+numpy>=2.0
+tqdm>=4.60
+
+# Vision / video I/O
+opencv-python>=4.10
+Pillow>=12.0
+torchvision
+
+# Logging
+tensorboard>=2.18
+wandb>=0.25
+
+# Evaluation metrics
+piq>=0.8
+lpips>=0.1.4
+torchmetrics>=1.8
+pytorch-msssim>=1.0
+transformers>=4.51  # CLIP for FID-like metrics

@@ -1,6 +1,10 @@
+# Conda environment for LAM training
+# Usage: conda env create -f environment.yml
+#        conda activate dreamdojo_lam
+# Then:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#        pip install -r external/lam_project/requirements.txt
 name: dreamdojo_lam
 channels:
   - defaults
 dependencies:
   - python=3.10
-prefix: /n/fs/geniemodel/conda/envs/dreamdojo_lam
