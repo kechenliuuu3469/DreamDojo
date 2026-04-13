@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=lam_both
+#SBATCH --job-name=lam_eval
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:8
+#SBATCH --partition=ailab
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=256G
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=80G
+#SBATCH --time=6:00:00
 #SBATCH --output=slurm_outputs/%x/out_%x_%j.out
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=kl0820@princeton.edu
@@ -19,7 +20,7 @@ export CONDA_PKGS_DIRS=/scratch/gpfs/AM43/users/kl0820/envs/conda/pkgs
 conda activate dreamdojo_lam
 
 # ============================================
-# Thread limits (fixes OpenCV thread errors)
+# Thread limits
 # ============================================
 export OMP_NUM_THREADS=4
 export OPENCV_NUM_THREADS=2
@@ -31,37 +32,22 @@ export MKL_NUM_THREADS=4
 cd /scratch/gpfs/AM43/users/kl0820/projects/DreamDojo/external/lam_project
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-export WANDB_API_KEY=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
-
-
-mkdir -p slurm_outputs/lam_bridge_full
-mkdir -p exp_ckpts_bridge_full
-mkdir -p exp_imgs_bridge_full
+mkdir -p slurm_outputs/lam_eval
 
 # ============================================
-# Run training
+# Run evaluation
 # ============================================
 echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
-echo "Num GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
-echo "GPU type: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "Start time: $(date)"
 echo "=========================================="
 
-rm -rf wandb/
-
-export WANDB_RESUME=never
-export WANDB_RUN_ID=$(python -c "import wandb; print(wandb.util.generate_id())")
-
-torchrun \
-    --nnodes=1 \
-    --nproc_per_node=8 \
-    main.py fit \
-    --config config/lam_bridge_droid_full.yaml \
-    --data.num_workers=4 \
-    --ckpt_path /n/fs/geniemodel/DreamDojo/external/lam_project/exp_ckpts_bridge_droid_full/last.ckpt \
-    2>/dev/null
+python eval_suite/eval_lam_full.py \
+    --num_samples 10 \
+    --device cuda:0 \
+    --output_dir eval_results_test
 
 echo "=========================================="
 echo "End time: $(date)"

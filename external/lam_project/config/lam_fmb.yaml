@@ -8,7 +8,7 @@ model:
   lam_num_heads: 16
   beta: 0.000001
   log_interval: 1000
-  log_path: exp_imgs_bridge_full
+  log_path: exp_imgs_fmb
   optimizer:
     class_path: torch.optim.AdamW
     init_args:
@@ -16,18 +16,24 @@ model:
       weight_decay: 1e-2
 
 data:
-  batch_size: 64
+  batch_size: 8
   dataset_paths:
-    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/bridge/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/fmb/videos/train
+  stacking_modes:
+    - dreamzero
+  view_maps:
+    - wrist: "2.mp4"
+      left: "0.mp4"
+      right: "1.mp4"
   padding: repeat
   randomize: true
   num_frames: 2
   output_format: t h w c
-  samples_per_epoch: 250000
+  samples_per_epoch: 10000
   sampling_strategy: dataset
 
 trainer:
-  max_epochs: 100
+  max_epochs: 50
   accelerator: gpu
   num_nodes: 1
   devices: auto
@@ -39,7 +45,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: exp_ckpts_bridge_full
+        dirpath: exp_ckpts_fmb
         monitor: train_loss
         verbose: true
         save_last: true
@@ -49,10 +55,10 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: exp_logs
-        name: lam_bridge_full
+        name: lam_fmb
     - class_path: lightning.pytorch.loggers.WandbLogger
       init_args:
         project: lam-training
-        name: lam_bridge_full
+        name: lam_fmb
         save_dir: exp_logs
         log_model: false

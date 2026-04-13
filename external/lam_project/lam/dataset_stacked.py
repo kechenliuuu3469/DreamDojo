@@ -56,12 +56,14 @@ def exists(var) -> bool:
 
 class StackedDroidVideoDataset(Dataset):
     """
-    DROID dataset that loads all 3 camera views and stacks them into one image.
+    Multi-view dataset that loads camera views and stacks them into one image.
 
     Args:
-        stacking_mode: "vertical" for Ctrl-World style (0,1,2 top to bottom)
+        stacking_mode: "vertical" for Ctrl-World style (3 views top to bottom)
                        "dreamzero" for DreamZero style (wrist on top, left+right on bottom)
-        wrist_view, left_view, right_view: filenames for each camera view
+                       "horizontal" for side-by-side (left + right, 2 views)
+        wrist_view: filename for wrist camera (not used in "horizontal" mode)
+        left_view, right_view: filenames for the two side cameras
     """
 
     def __init__(
@@ -73,7 +75,7 @@ class StackedDroidVideoDataset(Dataset):
         output_format: str = "t h w c",
         color_aug: bool = True,
         rgb_skip: int = 1,
-        stacking_mode: str = "vertical",  # "vertical" or "dreamzero"
+        stacking_mode: str = "vertical",
         wrist_view: str = "2.mp4",
         left_view: str = "0.mp4",
         right_view: str = "1.mp4",
@@ -90,25 +92,39 @@ class StackedDroidVideoDataset(Dataset):
         self.left_view = left_view
         self.right_view = right_view
 
-        assert stacking_mode in ("vertical", "dreamzero"), \
-            f"stacking_mode must be 'vertical' or 'dreamzero', got '{stacking_mode}'"
+        assert stacking_mode in ("vertical", "dreamzero", "horizontal"), \
+            f"stacking_mode must be 'vertical', 'dreamzero', or 'horizontal', got '{stacking_mode}'"
 
-        # Find all episode directories that have all 3 views
-        mp4_list = list(Path(subset_path).rglob("0.mp4"))
-        self.episode_dirs = []
-        for f in mp4_list:
-            episode_dir = f.parent
-            if (episode_dir / left_view).exists() and \
-               (episode_dir / right_view).exists() and \
-               (episode_dir / wrist_view).exists():
-                self.episode_dirs.append(str(episode_dir))
+        # Find all episode directories that have the required views
+        if stacking_mode == "horizontal":
+            # Only need left + right views
+            mp4_list = list(Path(subset_path).rglob(left_view))
+            self.episode_dirs = []
+            for f in mp4_list:
+                episode_dir = f.parent
+                if (episode_dir / right_view).exists():
+                    self.episode_dirs.append(str(episode_dir))
+            required_views = f"{left_view}, {right_view}"
+        else:
+            # Need all 3 views
+            mp4_list = list(Path(subset_path).rglob(wrist_view))
+            self.episode_dirs = []
+            for f in mp4_list:
+                episode_dir = f.parent
+                if (episode_dir / left_view).exists() and \
+                   (episode_dir / right_view).exists() and \
+                   (episode_dir / wrist_view).exists():
+                    self.episode_dirs.append(str(episode_dir))
+            required_views = f"wrist={wrist_view}, left={left_view}, right={right_view}"
 
         self.episode_dirs = sorted(self.episode_dirs)
         if len(self.episode_dirs) == 0:
-            raise ValueError(f"No complete DROID episodes found in {subset_path}")
+            raise ValueError(f"No complete multi-view episodes found in {subset_path} "
+                             f"(looking for {required_views})")
 
-        print(f"StackedDroidVideoDataset: {len(self.episode_dirs)} episodes, "
-              f"stacking_mode={stacking_mode}, rgb_skip={rgb_skip}")
+        print(f"StackedVideoDataset: {len(self.episode_dirs)} episodes, "
+              f"stacking_mode={stacking_mode}, rgb_skip={rgb_skip}, "
+              f"views: {required_views}")
 
     def __len__(self) -> int:
         return len(self.episode_dirs)
@@ -182,6 +198,24 @@ class StackedDroidVideoDataset(Dataset):
             stacked.append(frame)
         return stacked
 
+    def _stack_frames_horizontal(self, view0_frames, view1_frames):
+        """
+        Side-by-side: left + right horizontally.
+
+        ┌─────────────┬────────────┐
+        │  View 0     │   View 1   │  H × W each
+        └─────────────┴────────────┘
+        Result: H × 2W
+        """
+        stacked = []
+        for t in range(len(view0_frames)):
+            frame = np.concatenate([
+                view0_frames[t],
+                view1_frames[t]
+            ], axis=1)  # H × 2W × 3
+            stacked.append(frame)
+        return stacked
+
     def _stack_frames_dreamzero(self, view0_frames, view1_frames, view2_frames):
         """
         DreamZero style: wrist (view 2) on top doubled, left+right on bottom.
@@ -216,10 +250,9 @@ class StackedDroidVideoDataset(Dataset):
         num_frames: int,
         start_frame: int = None,
     ) -> Tensor:
-        """Load frames from all 3 views, stack them, return as video tensor."""
+        """Load frames from views, stack them, return as video tensor."""
         left_path = os.path.join(episode_dir, self.left_view)
         right_path = os.path.join(episode_dir, self.right_view)
-        wrist_path = os.path.join(episode_dir, self.wrist_view)
 
         # Get total frames
         cap = cv.VideoCapture(left_path)
@@ -239,16 +272,20 @@ class StackedDroidVideoDataset(Dataset):
         )
         raw_start = start_frame * rgb_skip
 
-        # Load frames from all 3 views with same timing
+        # Load frames from views with same timing
         view0_frames = self._read_frames_sequential(left_path, raw_start, needed_frames, rgb_skip)
         view1_frames = self._read_frames_sequential(right_path, raw_start, needed_frames, rgb_skip)
-        view2_frames = self._read_frames_sequential(wrist_path, raw_start, needed_frames, rgb_skip)
 
         # Stack views based on mode
-        if self.stacking_mode == "vertical":
-            stacked_frames = self._stack_frames_vertical(view0_frames, view1_frames, view2_frames)
-        elif self.stacking_mode == "dreamzero":
-            stacked_frames = self._stack_frames_dreamzero(view0_frames, view1_frames, view2_frames)
+        if self.stacking_mode == "horizontal":
+            stacked_frames = self._stack_frames_horizontal(view0_frames, view1_frames)
+        else:
+            wrist_path = os.path.join(episode_dir, self.wrist_view)
+            view2_frames = self._read_frames_sequential(wrist_path, raw_start, needed_frames, rgb_skip)
+            if self.stacking_mode == "vertical":
+                stacked_frames = self._stack_frames_vertical(view0_frames, view1_frames, view2_frames)
+            elif self.stacking_mode == "dreamzero":
+                stacked_frames = self._stack_frames_dreamzero(view0_frames, view1_frames, view2_frames)
 
         # Subsample with frame_skip
         stacked_frames = stacked_frames[::frame_skip]

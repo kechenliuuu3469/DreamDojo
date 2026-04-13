@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=lam_both
+#SBATCH --job-name=lam_bc_z
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:8
+#SBATCH --partition=ailab
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=slurm_outputs/%x/out_%x_%j.out
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=kl0820@princeton.edu
@@ -30,13 +31,12 @@ export MKL_NUM_THREADS=4
 # ============================================
 cd /scratch/gpfs/AM43/users/kl0820/projects/DreamDojo/external/lam_project
 export PYTHONPATH=$(pwd):$PYTHONPATH
-
+module load proxy/default
 export WANDB_API_KEY=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
 
-
-mkdir -p slurm_outputs/lam_bridge_full
-mkdir -p exp_ckpts_bridge_full
-mkdir -p exp_imgs_bridge_full
+mkdir -p slurm_outputs/lam_bc_z
+mkdir -p exp_ckpts_bc_z
+mkdir -p exp_imgs_bc_z
 
 # ============================================
 # Run training
@@ -47,21 +47,18 @@ echo "Node: $SLURM_NODELIST"
 echo "Num GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
 echo "GPU type: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 echo "Start time: $(date)"
+echo "Config: config/lam_bc_z.yaml"
+echo "Mode: FINE-TUNING from LAM_400k.ckpt"
 echo "=========================================="
-
-rm -rf wandb/
-
-export WANDB_RESUME=never
-export WANDB_RUN_ID=$(python -c "import wandb; print(wandb.util.generate_id())")
 
 torchrun \
     --nnodes=1 \
-    --nproc_per_node=8 \
+    --nproc_per_node=4 \
+    --master_port=$((29500 + RANDOM % 1000)) \
     main.py fit \
-    --config config/lam_bridge_droid_full.yaml \
+    --config config/lam_bc_z.yaml \
     --data.num_workers=4 \
-    --ckpt_path /n/fs/geniemodel/DreamDojo/external/lam_project/exp_ckpts_bridge_droid_full/last.ckpt \
-    2>/dev/null
+    --pretrained_ckpt /scratch/gpfs/AM43/users/kl0820/projects/DreamDojo/checkpoints/LAM_400k.ckpt
 
 echo "=========================================="
 echo "End time: $(date)"

@@ -1,0 +1,117 @@
+model:
+  image_channels: 3
+  lam_model_dim: 1024
+  lam_latent_dim: 32
+  lam_patch_size: 16
+  lam_enc_blocks: 24
+  lam_dec_blocks: 24
+  lam_num_heads: 16
+  beta: 0.000001
+  log_interval: 1000
+  log_path: exp_imgs_joint_all3
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 5e-6
+      weight_decay: 1e-2
+
+data:
+  batch_size: 64
+  # Order: EgoDex, Bridge, Fractal, DROID, BC-Z, FMB, Language Table, Taco Play, Furniture Bench, Roboturk
+  dataset_paths:
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/egodex/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/bridge/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/fractal/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/droid/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/bc_z/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/fmb/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/language_table/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/taco_play/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/furniture_bench/videos/train
+    - /scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4/roboturk/videos/train
+  sampling_strategy: manual
+  sampling_weights:
+    # EgoDex 30.0%, Bridge 14.8%, Fractal 14.2%, DROID 11.1%,
+    # BC-Z 8.4%, FMB 7.9%, Language Table 4.9%, Taco Play 3.4%,
+    # Furniture Bench 2.7%, Roboturk 2.6%
+    - 30.0
+    - 14.8
+    - 14.2
+    - 11.1
+    - 8.4
+    - 7.9
+    - 4.9
+    - 3.4
+    - 2.7
+    - 2.6
+  rgb_skips:
+    - 3   # EgoDex
+    - 1   # Bridge
+    - 3   # Fractal
+    - 1   # DROID
+    - 3   # BC-Z
+    - 3   # FMB
+    - 3   # Language Table
+    - 3   # Taco Play
+    - 3   # Furniture Bench
+    - 1   # Roboturk
+  stacking_modes:
+    - null        # EgoDex: single view
+    - null        # Bridge: single view
+    - null        # Fractal: single view
+    - dreamzero   # DROID: wrist on top, left+right below
+    - null        # BC-Z: single view
+    - dreamzero   # FMB: wrist on top, sides below
+    - null        # Language Table: single view
+    - null        # Taco Play: single view (view_filter)
+    - horizontal  # Furniture Bench: side by side
+    - null        # Roboturk: single view
+  view_maps:
+    - null                                          # EgoDex
+    - null                                          # Bridge
+    - null                                          # Fractal
+    - {wrist: "2.mp4", left: "0.mp4", right: "1.mp4"}  # DROID
+    - null                                          # BC-Z
+    - {wrist: "4.mp4", left: "0.mp4", right: "2.mp4"}  # FMB (wrist_1, side_1, side_2)
+    - null                                          # Language Table
+    - {view: "3.mp4"}                               # Taco Play (rgb_static only)
+    - {left: "0.mp4", right: "1.mp4"}               # Furniture Bench
+    - null                                          # Roboturk
+  padding: repeat
+  randomize: true
+  num_frames: 2
+  output_format: t h w c
+  samples_per_epoch: 500000
+
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  num_nodes: 1
+  devices: auto
+  strategy: ddp_find_unused_parameters_false
+  precision: 16-mixed
+  log_every_n_steps: 100
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.3
+  num_sanity_val_steps: 2
+  limit_val_batches: 10
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: exp_ckpts_joint_all3
+        monitor: train_loss
+        verbose: true
+        save_last: true
+        every_n_train_steps: 2000
+        save_top_k: 3
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: exp_logs
+        name: lam_joint_all3
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        project: lam-training
+        name: lam_joint_all3
+        save_dir: exp_logs
+        log_model: false

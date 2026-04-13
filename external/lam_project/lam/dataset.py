@@ -104,7 +104,10 @@ class LightningDataset(LightningDataModule):
             shuffle=self.train_shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            pin_memory=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -119,7 +122,10 @@ class LightningDataset(LightningDataModule):
             shuffle=self.val_shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            pin_memory=True,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -147,7 +153,8 @@ class VideoDataset(Dataset):
         num_frames: int = 16,
         output_format: str = "t h w c",
         color_aug: bool = True,
-        rgb_skip: int = 1
+        rgb_skip: int = 1,
+        view_filter: Optional[str] = None,
     ) -> None:
         super(VideoDataset, self).__init__()
         self.padding = padding
@@ -159,7 +166,10 @@ class VideoDataset(Dataset):
 
         mp4_list = list(Path(subset_path).rglob("*.mp4"))
         if len(mp4_list) > 0:
-            if "xdof" in subset_path:
+            if view_filter is not None:
+                # Use only files matching the specified filename (e.g. "1.mp4")
+                self.file_names = [f for f in mp4_list if f.name == view_filter]
+            elif "xdof" in subset_path:
                 self.file_names = filter_video_files(mp4_list, xdof=True)
             elif "droid" in subset_path.lower():
                 self.file_names = [f for f in mp4_list if f.name in ("0.mp4", "1.mp4", "2.mp4")]
@@ -381,50 +391,100 @@ class MultiSourceSamplerDataset(Dataset):
         split: str = "train",
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
+        sampling_weights: Optional[list] = None,
         color_aug: bool = True,
         rgb_skips: Optional[list] = None,
         stacking_mode: Optional[str] = None,
+        stacking_modes: Optional[list] = None,
+        view_maps: Optional[list] = None,
         **kwargs
     ) -> None:
         self.samples_per_epoch = samples_per_epoch
 
+        if split != "train":
+            dataset_paths = [p.replace("/train", f"/{split}") for p in dataset_paths]
+            print(f"[{split}] Dataset paths: {dataset_paths}")
+
+        n = len(dataset_paths)
+
         if rgb_skips is None:
-            rgb_skips = [1] * len(dataset_paths)
-        elif len(rgb_skips) != len(dataset_paths):
+            rgb_skips = [1] * n
+        elif len(rgb_skips) != n:
             raise ValueError(
                 f"rgb_skips length ({len(rgb_skips)}) must match "
-                f"dataset_paths length ({len(dataset_paths)})"
+                f"dataset_paths length ({n})"
+            )
+
+        # Per-dataset stacking: stacking_modes list takes priority over global stacking_mode
+        if stacking_modes is None:
+            if stacking_mode is not None:
+                # Legacy: apply global stacking_mode only to "droid" paths
+                stacking_modes = [
+                    stacking_mode if "droid" in p.lower() else None
+                    for p in dataset_paths
+                ]
+            else:
+                stacking_modes = [None] * n
+        elif len(stacking_modes) != n:
+            raise ValueError(
+                f"stacking_modes length ({len(stacking_modes)}) must match "
+                f"dataset_paths length ({n})"
+            )
+
+        if view_maps is None:
+            view_maps = [None] * n
+        elif len(view_maps) != n:
+            raise ValueError(
+                f"view_maps length ({len(view_maps)}) must match "
+                f"dataset_paths length ({n})"
             )
 
         self.subsets = []
-        for subset_path, skip in tqdm(zip(dataset_paths, rgb_skips), desc="Loading subsets...", total=len(dataset_paths)):
-            if stacking_mode is not None and "droid" in subset_path.lower():
-                # Use stacked multi-view dataset for DROID
+        for subset_path, skip, smode, vmap in tqdm(
+            zip(dataset_paths, rgb_skips, stacking_modes, view_maps),
+            desc="Loading subsets...", total=n
+        ):
+            if smode is not None:
+                # Use stacked multi-view dataset
                 from lam.dataset_stacked import StackedDroidVideoDataset
-                self.subsets.append(StackedDroidVideoDataset(
+                stacked_kwargs = dict(
                     subset_path=subset_path,
                     color_aug=color_aug,
                     rgb_skip=skip,
-                    stacking_mode=stacking_mode,
+                    stacking_mode=smode,
                     num_frames=kwargs.get('num_frames', 16),
                     randomize=kwargs.get('randomize', False),
                     padding=kwargs.get('padding', 'repeat'),
                     output_format=kwargs.get('output_format', 't h w c'),
-                ))
+                )
+                if vmap is not None:
+                    stacked_kwargs['wrist_view'] = vmap.get('wrist', '2.mp4')
+                    stacked_kwargs['left_view'] = vmap.get('left', '0.mp4')
+                    stacked_kwargs['right_view'] = vmap.get('right', '1.mp4')
+                self.subsets.append(StackedDroidVideoDataset(**stacked_kwargs))
                 print(f"Subset: {subset_path} | Episodes: {len(self.subsets[-1])} | "
-                      f"rgb_skip: {skip} | stacking: {stacking_mode}")
+                      f"rgb_skip: {skip} | stacking: {smode} | views: {vmap}")
             else:
                 # Use regular single-view dataset
+                view_filter = vmap.get('view') if vmap is not None else None
                 self.subsets.append(VideoDataset(
                     subset_path=subset_path,
                     color_aug=color_aug,
                     rgb_skip=skip,
+                    view_filter=view_filter,
                     **kwargs
                 ))
-                print(f"Subset: {subset_path} | Videos: {len(self.subsets[-1])} | rgb_skip: {skip}")
+                print(f"Subset: {subset_path} | Videos: {len(self.subsets[-1])} | "
+                      f"rgb_skip: {skip} | view_filter: {view_filter}")
         print("Number of subsets:", len(self.subsets))
 
-        if sampling_strategy == "sample":
+        if sampling_strategy == "manual":
+            assert sampling_weights is not None, \
+                "sampling_weights must be provided when sampling_strategy='manual'"
+            assert len(sampling_weights) == n, \
+                f"sampling_weights length ({len(sampling_weights)}) must match dataset_paths length ({n})"
+            probs = sampling_weights
+        elif sampling_strategy == "sample":
             probs = [len(d) for d in self.subsets]
         elif sampling_strategy == "dataset":
             probs = [1 for _ in self.subsets]
@@ -459,8 +519,11 @@ class LightningVideoDataset(LightningDataset):
         output_format: str = "t h w c",
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
+        sampling_weights: Optional[list] = None,
         rgb_skips: Optional[list] = None,
         stacking_mode: Optional[str] = None,
+        stacking_modes: Optional[list] = None,
+        view_maps: Optional[list] = None,
         **kwargs
     ) -> None:
         super(LightningVideoDataset, self).__init__(**kwargs)
@@ -471,8 +534,11 @@ class LightningVideoDataset(LightningDataset):
         self.output_format = output_format
         self.samples_per_epoch = samples_per_epoch
         self.sampling_strategy = sampling_strategy
+        self.sampling_weights = sampling_weights
         self.rgb_skips = rgb_skips
         self.stacking_mode = stacking_mode
+        self.stacking_modes = stacking_modes
+        self.view_maps = view_maps
 
         self.save_hyperparameters()
 
@@ -487,21 +553,29 @@ class LightningVideoDataset(LightningDataset):
                 output_format=self.output_format,
                 samples_per_epoch=self.samples_per_epoch,
                 sampling_strategy=self.sampling_strategy,
+                sampling_weights=self.sampling_weights,
                 rgb_skips=self.rgb_skips,
                 stacking_mode=self.stacking_mode,
+                stacking_modes=self.stacking_modes,
+                view_maps=self.view_maps,
             )
 
-            # self.val_dataset = MultiSourceSamplerDataset(
-            #     dataset_paths=self.dataset_paths,
-            #     split="test",
-            #     padding=self.padding,
-            #     randomize=self.randomize,
-            #     num_frames=self.num_frames,
-            #     output_format=self.output_format,
-            #     samples_per_epoch=self.samples_per_epoch // 1000,
-            #     sampling_strategy=self.sampling_strategy,
-            #     color_aug=False
-            # )
+            self.val_dataset = MultiSourceSamplerDataset(
+                dataset_paths=self.dataset_paths,
+                split="val",
+                padding=self.padding,
+                randomize=self.randomize,
+                num_frames=self.num_frames,
+                output_format=self.output_format,
+                samples_per_epoch=self.samples_per_epoch // 100,
+                sampling_strategy=self.sampling_strategy,
+                sampling_weights=self.sampling_weights,
+                rgb_skips=self.rgb_skips,
+                stacking_mode=self.stacking_mode,
+                stacking_modes=self.stacking_modes,
+                view_maps=self.view_maps,
+                color_aug=False
+            )
 
         elif stage == "test":
             self.test_dataset = OriginalVideoDataset(
