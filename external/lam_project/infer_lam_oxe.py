@@ -165,20 +165,25 @@ def build_episode_tensor(episode_dir, cfg):
 # inference
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def extract_latents_for_video(model, frames, device, batch_size):
+def extract_latents_for_video(model, frames, device, batch_size, amp_dtype=None):
     """frames: [N, H, W, 3] -> [N-1, 32] latent actions (consecutive pairs)."""
     pairs = torch.stack([frames[:-1], frames[1:]], dim=1)  # [N-1, 2, H, W, 3]
     outs = []
+    use_amp = amp_dtype is not None and device.startswith("cuda")
     for i in range(0, pairs.shape[0], batch_size):
         batch = {"videos": pairs[i:i + batch_size].to(device, non_blocking=True)}
-        z_mu = model.lam(batch)["z_mu"]  # [B, 32]
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                z_mu = model.lam(batch)["z_mu"]
+        else:
+            z_mu = model.lam(batch)["z_mu"]
         outs.append(z_mu.float().cpu())
     return torch.cat(outs, dim=0)
 
 
 def process_dataset(model, dataset_root, dataset, cfg, percent,
                     device, batch_size, out_subdir, skip_existing,
-                    shard_idx=0, num_shards=1):
+                    shard_idx=0, num_shards=1, amp_dtype=None):
     videos_dir = Path(dataset_root) / dataset / "videos" / "train"
     out_root = Path(dataset_root) / dataset / out_subdir / "train"
 
@@ -210,7 +215,7 @@ def process_dataset(model, dataset_root, dataset, cfg, percent,
             if frames is None:
                 n_fail += 1
                 continue
-            latents = extract_latents_for_video(model, frames, device, batch_size)
+            latents = extract_latents_for_video(model, frames, device, batch_size, amp_dtype)
             out_dir.mkdir(parents=True, exist_ok=True)
             np.save(out_path, latents.numpy().astype(np.float32))
             n_ok += 1
@@ -238,6 +243,8 @@ def main():
                     help="Shard index for multi-GPU sharding (0..num_shards-1).")
     ap.add_argument("--num_shards", type=int, default=1,
                     help="Total number of shards. Episodes are strided across shards.")
+    ap.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16",
+                    help="Autocast dtype for the forward pass (H100: use bf16).")
     args = ap.parse_args()
 
     assert 0 <= args.shard_idx < args.num_shards, \
@@ -246,6 +253,10 @@ def main():
     for ds in args.datasets:
         if ds not in DATASET_CFG:
             raise ValueError(f"unknown dataset {ds}; known: {list(DATASET_CFG)}")
+
+    amp_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
+    if amp_dtype is not None:
+        print(f"[lam] autocast enabled: {args.precision}")
 
     model = load_model(args.ckpt_path, args.device)
 
@@ -262,6 +273,7 @@ def main():
             skip_existing=not args.overwrite,
             shard_idx=args.shard_idx,
             num_shards=args.num_shards,
+            amp_dtype=amp_dtype,
         )
 
 
