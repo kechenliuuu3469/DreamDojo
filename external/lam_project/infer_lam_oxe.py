@@ -17,6 +17,7 @@ The --percent flag limits to the first X% of episodes per dataset.
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -26,6 +27,25 @@ from einops import rearrange
 from tqdm import tqdm
 
 from lam.model import LAM
+
+
+# Module-level decoder state, set once in main() and read by the video readers.
+# "cv2"    -> OpenCV VideoCapture (CPU, software)
+# "decord" -> decord.VideoReader  (CPU or NVDEC, depending on _DECORD_CTX)
+_DECODER = "cv2"
+_DECORD_CTX = None  # set to decord.cpu(0) or decord.gpu(0) when decoder="decord"
+
+
+def _set_decoder(decoder: str, decord_gpu: bool):
+    global _DECODER, _DECORD_CTX
+    _DECODER = decoder
+    if decoder == "decord":
+        from decord import cpu, gpu, bridge  # noqa: F401
+        _DECORD_CTX = gpu(0) if decord_gpu else cpu(0)
+        print(f"[decoder] decord ctx={'gpu(0)' if decord_gpu else 'cpu(0)'}")
+    else:
+        _DECORD_CTX = None
+        print("[decoder] cv2.VideoCapture")
 
 
 # Per-dataset pipeline config, mirroring config/lam_joint_all.yaml exactly.
@@ -93,8 +113,7 @@ def load_model(ckpt_path, device,
 # ---------------------------------------------------------------------------
 # video reading
 # ---------------------------------------------------------------------------
-def read_strided_frames_np(video_path, rgb_skip):
-    """Return a list of HxWx3 uint8 numpy arrays, keeping every rgb_skip-th frame."""
+def _read_cv2(video_path, rgb_skip):
     cap = cv2.VideoCapture(str(video_path))
     frames = []
     idx = 0
@@ -107,6 +126,28 @@ def read_strided_frames_np(video_path, rgb_skip):
         idx += 1
     cap.release()
     return frames
+
+
+def _read_decord(video_path, rgb_skip):
+    """decord reads RGB directly and can seek/batch-decode; ~3–5x faster for strided reads."""
+    from decord import VideoReader
+    vr = VideoReader(str(video_path), ctx=_DECORD_CTX)
+    n = len(vr)
+    if n <= 0:
+        return []
+    idxs = list(range(0, n, rgb_skip))
+    if not idxs:
+        return []
+    batch = vr.get_batch(idxs).asnumpy()  # [N, H, W, 3] uint8, RGB
+    # Return list-of-arrays to match the cv2 reader's contract used by the composers.
+    return [batch[i] for i in range(batch.shape[0])]
+
+
+def read_strided_frames_np(video_path, rgb_skip):
+    """Return a list of HxWx3 uint8 numpy arrays, keeping every rgb_skip-th frame."""
+    if _DECODER == "decord":
+        return _read_decord(video_path, rgb_skip)
+    return _read_cv2(video_path, rgb_skip)
 
 
 def compose_single_view(episode_dir, view_map, rgb_skip):
@@ -273,9 +314,45 @@ def _enumerate_episodes(dataset_root, dataset, cfg):
     return items, len(items)
 
 
+def _decode_item(item, cfg):
+    """Run the decode pipeline for one episode. Returns (frames_tensor_or_None, error_or_None)."""
+    try:
+        if item["source"] == "file":
+            frames = build_episode_tensor_from_file(item["path"], cfg["rgb_skip"])
+        else:
+            frames = build_episode_tensor(item["path"], cfg)
+        return frames, None
+    except Exception as e:
+        return None, e
+
+
+def _iter_decoded(items, cfg, prefetch):
+    """Yield (item, frames, err) in order.
+
+    With prefetch=True, decode runs in a background thread so decoding of
+    episode N+1 overlaps with compute/IO of episode N.
+    """
+    if not items:
+        return
+    if not prefetch:
+        for item in items:
+            frames, err = _decode_item(item, cfg)
+            yield item, frames, err
+        return
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_decode_item, items[0], cfg)
+        for idx in range(len(items)):
+            frames, err = fut.result()
+            if idx + 1 < len(items):
+                fut = ex.submit(_decode_item, items[idx + 1], cfg)
+            yield items[idx], frames, err
+
+
 def process_dataset(model, dataset_root, dataset, cfg, percent,
                     device, batch_size, out_subdir, skip_existing,
-                    shard_idx=0, num_shards=1, amp_dtype=None):
+                    shard_idx=0, num_shards=1, amp_dtype=None,
+                    prefetch=False):
     out_base = Path(dataset_root) / dataset / out_subdir
 
     items, n_total = _enumerate_episodes(dataset_root, dataset, cfg)
@@ -284,34 +361,46 @@ def process_dataset(model, dataset_root, dataset, cfg, percent,
     # Stride-shard so every shard sees a balanced mix of short/long episodes.
     items = items[shard_idx::num_shards]
 
-    src = "manifest" if cfg.get("manifest") else "dir"
-    print(f"\n[{dataset}] src={src} rgb_skip={cfg['rgb_skip']} "
-          f"stacking={cfg['stacking_mode']} views={cfg['view_map']} "
-          f"| episodes {n_keep}/{n_total} ({percent}%) "
-          f"| shard {shard_idx}/{num_shards} -> {len(items)} eps "
-          f"| out -> {out_base}")
-
-    n_ok = n_skip = n_fail = 0
-    for item in tqdm(items, desc=dataset):
+    # Pre-filter skip_existing so the prefetch worker never decodes videos
+    # whose latents are already on disk.
+    n_skip = 0
+    todo = []
+    for item in items:
         out_dir = out_base / item["out_rel"]
         out_path = out_dir / "latent_actions.npy"
         if skip_existing and out_path.exists():
             n_skip += 1
             continue
+        item["_out_dir"] = out_dir
+        item["_out_path"] = out_path
+        todo.append(item)
+
+    src = "manifest" if cfg.get("manifest") else "dir"
+    print(f"\n[{dataset}] src={src} rgb_skip={cfg['rgb_skip']} "
+          f"stacking={cfg['stacking_mode']} views={cfg['view_map']} "
+          f"| episodes {n_keep}/{n_total} ({percent}%) "
+          f"| shard {shard_idx}/{num_shards} -> {len(items)} eps "
+          f"({n_skip} already done, {len(todo)} to do) "
+          f"| prefetch={prefetch} | out -> {out_base}")
+
+    n_ok = n_fail = 0
+    for item, frames, err in tqdm(
+        _iter_decoded(todo, cfg, prefetch), total=len(todo), desc=dataset
+    ):
+        if err is not None:
+            print(f"  [fail decode] {item['desc']}: {err}")
+            n_fail += 1
+            continue
+        if frames is None:
+            n_fail += 1
+            continue
         try:
-            if item["source"] == "file":
-                frames = build_episode_tensor_from_file(item["path"], cfg["rgb_skip"])
-            else:
-                frames = build_episode_tensor(item["path"], cfg)
-            if frames is None:
-                n_fail += 1
-                continue
             latents = extract_latents_for_video(model, frames, device, batch_size, amp_dtype)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            np.save(out_path, latents.numpy().astype(np.float32))
+            item["_out_dir"].mkdir(parents=True, exist_ok=True)
+            np.save(item["_out_path"], latents.numpy().astype(np.float32))
             n_ok += 1
         except Exception as e:
-            print(f"  [fail] {item['desc']}: {e}")
+            print(f"  [fail compute] {item['desc']}: {e}")
             n_fail += 1
 
     print(f"[{dataset}] done: ok={n_ok} skip={n_skip} fail={n_fail}")
@@ -337,6 +426,13 @@ def main():
                     help="Total number of shards. Episodes are strided across shards.")
     ap.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16",
                     help="Autocast dtype for the forward pass (H100: use bf16).")
+    ap.add_argument("--decoder", choices=["cv2", "decord"], default="decord",
+                    help="Video decoder. 'decord' is much faster for strided reads.")
+    ap.add_argument("--decord_gpu", action="store_true",
+                    help="Use decord with NVDEC (gpu(0)) instead of CPU decode.")
+    ap.add_argument("--prefetch", action="store_true", default=True,
+                    help="Decode episode N+1 in a background thread while N runs on GPU.")
+    ap.add_argument("--no_prefetch", dest="prefetch", action="store_false")
     args = ap.parse_args()
 
     assert 0 <= args.shard_idx < args.num_shards, \
@@ -365,6 +461,8 @@ def main():
     if amp_dtype is not None:
         print(f"[lam] autocast enabled: {args.precision}")
 
+    _set_decoder(args.decoder, args.decord_gpu)
+
     model = load_model(args.ckpt_path, args.device)
 
     for ds in args.datasets:
@@ -381,6 +479,7 @@ def main():
             shard_idx=args.shard_idx,
             num_shards=args.num_shards,
             amp_dtype=amp_dtype,
+            prefetch=args.prefetch,
         )
 
 
