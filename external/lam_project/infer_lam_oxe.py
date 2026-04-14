@@ -162,7 +162,8 @@ def extract_latents_for_video(model, frames, device, batch_size):
 
 
 def process_dataset(model, dataset_root, dataset, cfg, percent,
-                    device, batch_size, out_subdir, skip_existing):
+                    device, batch_size, out_subdir, skip_existing,
+                    shard_idx=0, num_shards=1):
     videos_dir = Path(dataset_root) / dataset / "videos" / "train"
     out_root = Path(dataset_root) / dataset / out_subdir / "train"
 
@@ -173,10 +174,14 @@ def process_dataset(model, dataset_root, dataset, cfg, percent,
     n_total = len(episodes)
     n_keep = max(1, int(round(n_total * percent / 100.0))) if n_total else 0
     episodes = episodes[:n_keep]
+    # Stride-shard so every shard sees a balanced mix of short/long episodes.
+    episodes = episodes[shard_idx::num_shards]
 
     print(f"\n[{dataset}] rgb_skip={cfg['rgb_skip']} "
           f"stacking={cfg['stacking_mode']} views={cfg['view_map']} "
-          f"| episodes {n_keep}/{n_total} ({percent}%) | out -> {out_root}")
+          f"| episodes {n_keep}/{n_total} ({percent}%) "
+          f"| shard {shard_idx}/{num_shards} -> {len(episodes)} eps "
+          f"| out -> {out_root}")
 
     n_ok = n_skip = n_fail = 0
     for ep in tqdm(episodes, desc=dataset):
@@ -214,7 +219,14 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out_subdir", default="latent_actions_lam")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--shard_idx", type=int, default=0,
+                    help="Shard index for multi-GPU sharding (0..num_shards-1).")
+    ap.add_argument("--num_shards", type=int, default=1,
+                    help="Total number of shards. Episodes are strided across shards.")
     args = ap.parse_args()
+
+    assert 0 <= args.shard_idx < args.num_shards, \
+        f"shard_idx={args.shard_idx} must be in [0, {args.num_shards})"
 
     for ds in args.datasets:
         if ds not in DATASET_CFG:
@@ -233,6 +245,8 @@ def main():
             batch_size=args.batch_size,
             out_subdir=args.out_subdir,
             skip_existing=not args.overwrite,
+            shard_idx=args.shard_idx,
+            num_shards=args.num_shards,
         )
 
 
