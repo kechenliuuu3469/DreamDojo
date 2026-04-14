@@ -27,19 +27,36 @@ from tqdm import tqdm
 from lam.model import LAM
 
 
-# Per-dataset pipeline config (subset of config/lam_joint_all.yaml we care about).
-# stacking_mode: None  -> single view (view_map["view"] names the mp4)
-#                "dreamzero" -> wrist on top, left+right below (2H x 2W)
-#                "horizontal" -> left|right side by side (H x 2W)
+# Per-dataset pipeline config, mirroring config/lam_joint_all.yaml exactly.
+# stacking_mode:
+#   None         -> single view. view_map["view"] names the mp4 explicitly;
+#                   if view_map is None we fall back to filter_video_files
+#                   (the same rule used by the training VideoDataset).
+#   "dreamzero"  -> wrist on top, left+right below  (2H x 2W)
+#   "horizontal" -> left|right side by side         (H  x 2W)
 DATASET_CFG = {
-    "bc_z":            {"rgb_skip": 3, "stacking_mode": None,         "view_map": {"view": "0.mp4"}},
+    "egodex":          {"rgb_skip": 3, "stacking_mode": None,         "view_map": None},
     "bridge":          {"rgb_skip": 1, "stacking_mode": None,         "view_map": {"view": "rgb.mp4"}},
     "fractal":         {"rgb_skip": 3, "stacking_mode": None,         "view_map": {"view": "0.mp4"}},
     "droid":           {"rgb_skip": 1, "stacking_mode": "dreamzero",  "view_map": {"wrist": "2.mp4", "left": "0.mp4", "right": "1.mp4"}},
+    "bc_z":            {"rgb_skip": 3, "stacking_mode": None,         "view_map": {"view": "0.mp4"}},
     "fmb":             {"rgb_skip": 3, "stacking_mode": "dreamzero",  "view_map": {"wrist": "4.mp4", "left": "0.mp4", "right": "2.mp4"}},
+    "language_table":  {"rgb_skip": 3, "stacking_mode": None,         "view_map": None},
     "taco_play":       {"rgb_skip": 3, "stacking_mode": None,         "view_map": {"view": "3.mp4"}},
     "furniture_bench": {"rgb_skip": 3, "stacking_mode": "horizontal", "view_map": {"left": "0.mp4", "right": "1.mp4"}},
+    "roboturk":        {"rgb_skip": 1, "stacking_mode": None,         "view_map": None},
 }
+
+
+def filter_video_files(mp4_paths):
+    """Mirror of lam/dataset.filter_video_files (xdof=False branch)."""
+    return [
+        p for p in mp4_paths
+        if "left"   not in p.name.lower()
+        and "right"  not in p.name.lower()
+        and "resize" not in p.name.lower()
+        and "pad"    not in p.name.lower()
+    ]
 
 TARGET_H, TARGET_W = 240, 320
 TARGET_RATIO = 640 / 480
@@ -91,10 +108,16 @@ def read_strided_frames_np(video_path, rgb_skip):
 
 
 def compose_single_view(episode_dir, view_map, rgb_skip):
-    fname = view_map["view"]
-    path = episode_dir / fname
-    if not path.exists():
-        return None
+    if view_map is not None and "view" in view_map:
+        path = episode_dir / view_map["view"]
+        if not path.exists():
+            return None
+    else:
+        # Fallback: match the training VideoDataset's filter_video_files rule.
+        candidates = filter_video_files(sorted(episode_dir.glob("*.mp4")))
+        if not candidates:
+            return None
+        path = candidates[0]
     return read_strided_frames_np(path, rgb_skip)
 
 
@@ -230,9 +253,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_path", required=True)
     ap.add_argument("--dataset_root", default="/scratch/gpfs/AM43/users/kl0820/datasets/oxe_mp4")
-    ap.add_argument("--datasets", nargs="+",
-                    default=["bc_z", "bridge", "droid", "fmb",
-                             "fractal", "furniture_bench", "taco_play"])
+    ap.add_argument("--datasets", nargs="*", default=None,
+                    help="Datasets to process. If omitted, auto-discovers every "
+                         "subdir of --dataset_root that has videos/train AND a known "
+                         "entry in DATASET_CFG.")
     ap.add_argument("--percent", type=float, default=100.0,
                     help="Process the first X%% of episodes per dataset.")
     ap.add_argument("--batch_size", type=int, default=64)
@@ -250,9 +274,24 @@ def main():
     assert 0 <= args.shard_idx < args.num_shards, \
         f"shard_idx={args.shard_idx} must be in [0, {args.num_shards})"
 
-    for ds in args.datasets:
-        if ds not in DATASET_CFG:
-            raise ValueError(f"unknown dataset {ds}; known: {list(DATASET_CFG)}")
+    if not args.datasets:
+        root = Path(args.dataset_root)
+        present = sorted(
+            p.name for p in root.iterdir()
+            if p.is_dir() and (p / "videos" / "train").is_dir()
+        )
+        args.datasets = [d for d in present if d in DATASET_CFG]
+        missing = [d for d in present if d not in DATASET_CFG]
+        print(f"[auto] discovered datasets under {root}: {present}")
+        print(f"[auto] processing (known in DATASET_CFG): {args.datasets}")
+        if missing:
+            print(f"[auto] skipping (no DATASET_CFG entry): {missing}")
+        if not args.datasets:
+            raise SystemExit("[auto] no known datasets found; pass --datasets explicitly")
+    else:
+        for ds in args.datasets:
+            if ds not in DATASET_CFG:
+                raise ValueError(f"unknown dataset {ds}; known: {list(DATASET_CFG)}")
 
     amp_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
     if amp_dtype is not None:
