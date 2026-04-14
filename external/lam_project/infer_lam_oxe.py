@@ -48,9 +48,24 @@ TARGET_RATIO = 640 / 480
 # ---------------------------------------------------------------------------
 # model
 # ---------------------------------------------------------------------------
-def load_model(ckpt_path, device):
+def load_model(ckpt_path, device,
+               lam_model_dim=1024, lam_latent_dim=32, lam_patch_size=16,
+               lam_enc_blocks=24, lam_dec_blocks=24, lam_num_heads=16):
+    """Load LAM with the exact architecture used for joint_all3 training."""
     print(f"[lam] loading {ckpt_path}")
-    model = LAM.load_from_checkpoint(ckpt_path, map_location=device)
+    print(f"[lam] arch: dim={lam_model_dim} enc={lam_enc_blocks} "
+          f"dec={lam_dec_blocks} heads={lam_num_heads} "
+          f"latent={lam_latent_dim} patch={lam_patch_size}")
+    model = LAM.load_from_checkpoint(
+        ckpt_path,
+        map_location=device,
+        lam_model_dim=lam_model_dim,
+        lam_latent_dim=lam_latent_dim,
+        lam_patch_size=lam_patch_size,
+        lam_enc_blocks=lam_enc_blocks,
+        lam_dec_blocks=lam_dec_blocks,
+        lam_num_heads=lam_num_heads,
+    )
     model = model.to(device).eval()
     print(f"[lam] params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     return model
