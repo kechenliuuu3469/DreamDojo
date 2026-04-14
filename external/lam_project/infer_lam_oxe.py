@@ -16,6 +16,7 @@ The --percent flag limits to the first X% of episodes per dataset.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -35,7 +36,8 @@ from lam.model import LAM
 #   "dreamzero"  -> wrist on top, left+right below  (2H x 2W)
 #   "horizontal" -> left|right side by side         (H  x 2W)
 DATASET_CFG = {
-    "egodex":          {"rgb_skip": 3, "stacking_mode": None,         "view_map": None},
+    "egodex":          {"rgb_skip": 3, "stacking_mode": None,         "view_map": None,
+                        "manifest": "annotations/annotations/manifest.json"},
     "bridge":          {"rgb_skip": 1, "stacking_mode": None,         "view_map": {"view": "rgb.mp4"}},
     "fractal":         {"rgb_skip": 3, "stacking_mode": None,         "view_map": {"view": "0.mp4"}},
     "droid":           {"rgb_skip": 1, "stacking_mode": "dreamzero",  "view_map": {"wrist": "2.mp4", "left": "0.mp4", "right": "1.mp4"}},
@@ -151,23 +153,11 @@ def compose_dreamzero(episode_dir, view_map, rgb_skip):
     return out
 
 
-def build_episode_tensor(episode_dir, cfg):
-    """Return a [N, 240, 320, 3] float tensor, or None if the episode is unusable."""
-    mode = cfg["stacking_mode"]
-    if mode is None:
-        frames = compose_single_view(episode_dir, cfg["view_map"], cfg["rgb_skip"])
-    elif mode == "horizontal":
-        frames = compose_horizontal(episode_dir, cfg["view_map"], cfg["rgb_skip"])
-    elif mode == "dreamzero":
-        frames = compose_dreamzero(episode_dir, cfg["view_map"], cfg["rgb_skip"])
-    else:
-        raise ValueError(f"unknown stacking_mode={mode}")
-
+def _frames_to_tensor(frames):
+    """Common post-processing: list of HxWx3 uint8 -> [N, 240, 320, 3] float tensor."""
     if frames is None or len(frames) < 2:
         return None
-
     video = torch.from_numpy(np.stack(frames)).float() / 255.0  # [N, H, W, 3]
-
     h, w = video.shape[1], video.shape[2]
     if w / h > TARGET_RATIO:
         th, tw = h, int(h * TARGET_RATIO)
@@ -181,7 +171,28 @@ def build_episode_tensor(episode_dir, cfg):
     video = rearrange(video, "t h w c -> c t h w")
     video = torch.nn.functional.interpolate(video, (TARGET_H, TARGET_W), mode="bilinear")
     video = rearrange(video, "c t h w -> t h w c").contiguous()
-    return video  # [N, 240, 320, 3]
+    return video
+
+
+def build_episode_tensor_from_file(mp4_path, rgb_skip):
+    """Single-view episode from a direct .mp4 path (e.g. egodex manifest entry)."""
+    if not Path(mp4_path).exists():
+        return None
+    return _frames_to_tensor(read_strided_frames_np(mp4_path, rgb_skip))
+
+
+def build_episode_tensor(episode_dir, cfg):
+    """Return a [N, 240, 320, 3] float tensor, or None if the episode is unusable."""
+    mode = cfg["stacking_mode"]
+    if mode is None:
+        frames = compose_single_view(episode_dir, cfg["view_map"], cfg["rgb_skip"])
+    elif mode == "horizontal":
+        frames = compose_horizontal(episode_dir, cfg["view_map"], cfg["rgb_skip"])
+    elif mode == "dreamzero":
+        frames = compose_dreamzero(episode_dir, cfg["view_map"], cfg["rgb_skip"])
+    else:
+        raise ValueError(f"unknown stacking_mode={mode}")
+    return _frames_to_tensor(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -204,37 +215,94 @@ def extract_latents_for_video(model, frames, device, batch_size, amp_dtype=None)
     return torch.cat(outs, dim=0)
 
 
-def process_dataset(model, dataset_root, dataset, cfg, percent,
-                    device, batch_size, out_subdir, skip_existing,
-                    shard_idx=0, num_shards=1, amp_dtype=None):
-    videos_dir = Path(dataset_root) / dataset / "videos" / "train"
-    out_root = Path(dataset_root) / dataset / out_subdir / "train"
+def _enumerate_episodes(dataset_root, dataset, cfg):
+    """
+    Return (items, n_total) where items is a list of dicts with keys:
+      - source: 'dir' or 'file'
+      - path:   Path to the episode dir (dir mode) or direct mp4 (file mode)
+      - out_rel: output subpath under <dataset>/<out_subdir>/, excluding filename
+      - desc:    short human label for logs
+    """
+    root = Path(dataset_root) / dataset
+    manifest = cfg.get("manifest")
 
+    if manifest is not None:
+        mpath = root / manifest
+        with open(mpath) as f:
+            entries = json.load(f)
+        if not isinstance(entries, list):
+            raise ValueError(f"{mpath}: expected top-level list, got {type(entries).__name__}")
+        entries = [e for e in entries if e.get("split", "train") == "train"]
+        # Stable order: task, then numeric episode id if possible.
+        def sort_key(e):
+            ep_id = e.get("episode_id", "")
+            try:
+                return (e.get("task", ""), int(ep_id), ep_id)
+            except (TypeError, ValueError):
+                return (e.get("task", ""), 0, ep_id)
+        entries.sort(key=sort_key)
+
+        items = []
+        for e in entries:
+            vrel = e["video_path"]                         # e.g. videos/train/<task>/<id>.mp4
+            vpath = root / vrel
+            out_rel = Path(vrel.replace("videos/", "", 1)).with_suffix("")  # train/<task>/<id>
+            items.append({
+                "source": "file",
+                "path": vpath,
+                "out_rel": out_rel,
+                "desc": f"{e.get('task','?')}/{e.get('episode_id','?')}",
+            })
+        return items, len(items)
+
+    # Default: episode-dir layout.
+    videos_dir = root / "videos" / "train"
     episodes = sorted(
         [p for p in videos_dir.iterdir() if p.is_dir()],
         key=lambda p: (len(p.name), p.name),
     )
-    n_total = len(episodes)
-    n_keep = max(1, int(round(n_total * percent / 100.0))) if n_total else 0
-    episodes = episodes[:n_keep]
-    # Stride-shard so every shard sees a balanced mix of short/long episodes.
-    episodes = episodes[shard_idx::num_shards]
+    items = [
+        {
+            "source": "dir",
+            "path": p,
+            "out_rel": Path("train") / p.name,
+            "desc": p.name,
+        }
+        for p in episodes
+    ]
+    return items, len(items)
 
-    print(f"\n[{dataset}] rgb_skip={cfg['rgb_skip']} "
+
+def process_dataset(model, dataset_root, dataset, cfg, percent,
+                    device, batch_size, out_subdir, skip_existing,
+                    shard_idx=0, num_shards=1, amp_dtype=None):
+    out_base = Path(dataset_root) / dataset / out_subdir
+
+    items, n_total = _enumerate_episodes(dataset_root, dataset, cfg)
+    n_keep = max(1, int(round(n_total * percent / 100.0))) if n_total else 0
+    items = items[:n_keep]
+    # Stride-shard so every shard sees a balanced mix of short/long episodes.
+    items = items[shard_idx::num_shards]
+
+    src = "manifest" if cfg.get("manifest") else "dir"
+    print(f"\n[{dataset}] src={src} rgb_skip={cfg['rgb_skip']} "
           f"stacking={cfg['stacking_mode']} views={cfg['view_map']} "
           f"| episodes {n_keep}/{n_total} ({percent}%) "
-          f"| shard {shard_idx}/{num_shards} -> {len(episodes)} eps "
-          f"| out -> {out_root}")
+          f"| shard {shard_idx}/{num_shards} -> {len(items)} eps "
+          f"| out -> {out_base}")
 
     n_ok = n_skip = n_fail = 0
-    for ep in tqdm(episodes, desc=dataset):
-        out_dir = out_root / ep.name
+    for item in tqdm(items, desc=dataset):
+        out_dir = out_base / item["out_rel"]
         out_path = out_dir / "latent_actions.npy"
         if skip_existing and out_path.exists():
             n_skip += 1
             continue
         try:
-            frames = build_episode_tensor(ep, cfg)
+            if item["source"] == "file":
+                frames = build_episode_tensor_from_file(item["path"], cfg["rgb_skip"])
+            else:
+                frames = build_episode_tensor(item["path"], cfg)
             if frames is None:
                 n_fail += 1
                 continue
@@ -243,7 +311,7 @@ def process_dataset(model, dataset_root, dataset, cfg, percent,
             np.save(out_path, latents.numpy().astype(np.float32))
             n_ok += 1
         except Exception as e:
-            print(f"  [fail] {ep.name}: {e}")
+            print(f"  [fail] {item['desc']}: {e}")
             n_fail += 1
 
     print(f"[{dataset}] done: ok={n_ok} skip={n_skip} fail={n_fail}")
